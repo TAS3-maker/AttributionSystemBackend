@@ -1,0 +1,71 @@
+import express from "express";
+import {
+  getPlatformDashboard,
+  listWorkspaces,
+  getWorkspaceDetails,
+  setWorkspaceStatus,
+  updateWorkspaceSettings,
+  listWorkspaceUsers,
+  updateUser,
+  listPlatformApiKeys,
+  revokePlatformApiKey,
+  listPlatformConnectors,
+  setConnectorStatus,
+  listPlatformWebhooks,
+  updatePlatformWebhook,
+  deleteUser,
+  setWorkspacePlan,
+  revokeWorkspacePlan,
+} from "../controllers/platformAdminController.js";
+import { getWorkspaceDashboard } from "../controllers/platformAdminDashboardController.js";
+import * as tools from "../controllers/platformToolsController.js";
+
+import { startSupportSession, endSupportSession, listMySupportSessions } from "../controllers/supportAccessController.js";
+import { protectRoute, requireRole } from "../middlewares/protectRoute.js";
+
+const router = express.Router();
+
+// All routes require an authenticated platform admin.
+router.use(protectRoute);
+router.use(requireRole("platform_admin"));
+
+router.post("/support-sessions", startSupportSession);
+router.post("/support-sessions/:id/end", endSupportSession);
+router.get("/support-sessions", listMySupportSessions);
+
+router.get("/dashboard", getPlatformDashboard);
+router.get("/health", tools.getPlatformHealth);
+router.post("/jobs/:jobId/retry", tools.retryBackgroundJob);
+router.get("/approvals", tools.listApprovals);
+router.get("/audit-log", tools.listPlatformAuditLog);
+router.get("/fx-rates", tools.listFxRates);
+router.post("/fx-rates", tools.uploadFxRates);
+router.post("/workspaces", tools.createWorkspaceForCompany);
+router.post("/workspaces/:workspaceId/replay", tools.replayWorkspaceEvents);
+router.post("/workspaces/:workspaceId/rerun-attribution", tools.rerunWorkspaceAttribution);
+router.post("/workspaces/:workspaceId/rebuild-rollups", tools.rebuildWorkspaceRollups);
+router.delete("/workspaces/:workspaceId/data", tools.deleteCompanyData);
+router.post("/api-keys/:keyId/rotate", tools.rotateKeyForCompany);
+
+router.get("/workspaces", listWorkspaces);
+router.get("/workspaces/:workspaceId", getWorkspaceDetails);
+router.get("/workspaces/:workspaceId/dashboard", getWorkspaceDashboard);
+router.patch("/workspaces/:workspaceId/status", setWorkspaceStatus);
+router.patch("/workspaces/:workspaceId/settings", updateWorkspaceSettings);
+router.patch("/workspaces/:workspaceId/plan", setWorkspacePlan);
+router.post("/workspaces/:workspaceId/plan/revoke", revokeWorkspacePlan);
+router.get("/workspaces/:workspaceId/users", listWorkspaceUsers);
+
+router.patch("/users/:userId", updateUser);
+router.delete('/users/:userId', deleteUser);
+
+router.get("/api-keys", listPlatformApiKeys);
+router.post("/api-keys/:keyId/revoke", revokePlatformApiKey);
+
+router.get("/connectors", listPlatformConnectors);
+router.patch("/connectors/:connectorId/status", setConnectorStatus);
+
+router.get("/webhooks", listPlatformWebhooks);
+router.patch("/webhooks/:webhookId", updatePlatformWebhook);
+
+export default router;

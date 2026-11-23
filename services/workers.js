@@ -1,0 +1,183 @@
+/**
+ * Background workers, started once by server.js (disable with DISABLE_BACKGROUND_WORKERS=true, e.g.
+ * on extra API-only instances). Every task re-reads durable state from the database, so a restart
+ * or a second instance never loses work; idempotent processing makes double runs harmless.
+ *
+ *   every 15 s  queue due inbound events (pending after a restart, failed after their backoff)
+ *   every 1 min keep this instance's job locks fresh; resume stored jobs a stopped instance left
+ *               behind (or that wait for a retry)
+ *   every 30 s  queue due outbound webhook deliveries
+ *   every 10 min rebuild rollups that were never built for a company with data, and refresh rollups
+ *               that are behind
+ *   every hour  sync ad spend for connected Meta / Google accounts (each account at most every 6 h)
+ *               recover FX rates if the automated feed has no stored rows
+ *   every hour  sync ECB reference FX rates; when a rate changed, re-convert the sales and bookings it
+ *               affects (services/fxRevaluation.js) and rebuild those companies' rollups
+ *   every day   apply data retention
+ */
+
+import { db } from "../src/prisma/db.js";
+import { enqueueJob, registerJobHandler, drainJobs, resumeJobs, heartbeat, purgeFinishedJobs } from "./jobs.js";
+import { pollDueEvents } from "./eventQueue.js";
+import { pollDueDeliveries } from "./webhookDispatcher.js";
+import { rollupsAvailable, requestRebuild, staleWorkspaceIds } from "./rollups.js";
+import { reattributeWorkspace } from "./ingestion.js";
+import { applyRetention } from "./privacy.js";
+import { syncAccount, platformConfigured } from "./adPlatforms.js";
+import { writeAudit } from "./audit.js";
+import ENV from "../utils/env.js";
+import { findRate, syncLatestRates } from "./fx.js";
+import { applyRateChanges } from "./fxRevaluation.js";
+import "./rollups.js"; // registers the rollup job handlers
+
+const timers = [];
+const every = (ms, fn, label) => {
+    const run = () =>
+        Promise.resolve()
+            .then(fn)
+            .catch((err) => console.error(`[worker] ${label}:`, err?.message ?? err));
+    timers.push(setInterval(run, ms));
+    timers[timers.length - 1].unref?.();
+    return run;
+};
+
+registerJobHandler("attribution.rerun", async ({ workspaceId, from = null, to = null, actorUserId = null, reason = null }) => {
+    const out = await reattributeWorkspace(workspaceId, { from, to });
+    await requestRebuild(workspaceId); // never await a job of the same company lane from inside one
+    await writeAudit(db.orm.public, {
+        workspaceId,
+        actorType: actorUserId ? "user" : "system",
+        actorUserId,
+        action: "attribution.rerun_completed",
+        targetType: "workspace",
+        targetId: workspaceId,
+        metadata: { ...out, from, to, reason },
+    });
+    return out;
+});
+
+registerJobHandler("adspend.sync", ({ workspaceId, accountId }) => syncAccount(workspaceId, accountId));
+
+registerJobHandler("fxrates.sync", async () => {
+    const result = await syncLatestRates(db.orm.public, globalThis.fetch, { secondary: ENV.FX_SECONDARY_SOURCE_ENABLED });
+    const backfillFrom = `${result.startDate}T00:00:00.000Z`;
+    const candidates = (
+        await db.orm.public.Order
+            .where((o) => o.fxRateToReporting.isNull())
+            .where((o) => o.orderedAt.gte(backfillFrom))
+            .all()
+    );
+    const supportedCurrencies = new Set(result.currencies);
+    const touched = new Set();
+    let backfilled = 0;
+    for (const order of candidates) {
+        if (backfilled >= 20_000) break;
+        if (
+            !order.reportingCurrency ||
+            order.currency === order.reportingCurrency ||
+            !supportedCurrencies.has(order.currency) ||
+            !supportedCurrencies.has(order.reportingCurrency)
+        ) continue;
+        const rate = await findRate(db.orm.public, String(order.orderedAt).slice(0, 10), order.currency, order.reportingCurrency);
+        if (rate === null) continue;
+        await db.orm.public.Order.where({ id: order.id }).update({ fxRateToReporting: rate });
+        backfilled++;
+        touched.add(order.workspaceId);
+    }
+    for (const workspaceId of touched) await requestRebuild(workspaceId, "fx_rates");
+    // dynamic FX: re-convert the sales and bookings the changed rates affect (both FX modes)
+    const revalued = await applyRateChanges(result.changedDates ?? [], result.currencies ?? []);
+    console.info("[fx] rates synced", { date: result.date, written: result.written, changedDates: result.changedDates?.length ?? 0, backfilled, ...revalued, companies: undefined });
+    return { ...result, backfilled, ...revalued };
+});
+
+function fxRateSweep() {
+    if (!ENV.FX_AUTO_SYNC_ENABLED) return;
+    // hourly: the ECB publishes once per working day (~16:00 CET); a run that finds no change writes nothing
+    const now = new Date().toISOString();
+    enqueueJob("fxrates.sync", { day: now.slice(0, 13) });
+}
+
+async function recoverEmptyFxRates() {
+    if (!ENV.FX_AUTO_SYNC_ENABLED) return;
+    const existing = await db.orm.public.FxRate.where({ source: "frankfurter" }).first();
+    if (existing) return;
+    const day = new Date().toISOString().slice(0, 10);
+    enqueueJob("fxrates.sync", { day });
+}
+
+async function rollupSweep() {
+    if (!rollupsAvailable()) return;
+    for (const w of await db.orm.public.Workspace.where({ status: "active" }).all()) {
+        if (w.rollupsBuiltAt) continue;
+        const anyOrder = await db.orm.public.Order.where({ workspaceId: w.id }).first();
+        if (anyOrder) await requestRebuild(w.id);
+    }
+    // rollups left behind (a refresh lost a race, or failed): fold the dirty days in again
+    for (const id of await staleWorkspaceIds()) enqueueJob("rollups.flush", { workspaceId: id });
+}
+
+async function adSpendSweep() {
+    if (!platformConfigured("meta") && !platformConfigured("google")) return;
+    let accounts = [];
+    try {
+        accounts = await db.orm.public.AdAccount.where((a) => a.status.in(["healthy", "failing", "pending"])).all();
+    } catch {
+        return; // table not migrated
+    }
+    const sixHours = 6 * 3600_000;
+    for (const a of accounts) {
+        if (!platformConfigured(a.platform)) continue;
+        if (a.lastSyncedAt && Date.now() - new Date(a.lastSyncedAt).getTime() < sixHours) continue;
+        enqueueJob("adspend.sync", { workspaceId: a.workspaceId, accountId: a.id });
+    }
+}
+
+/** Check for past_due workspaces whose grace period (7 days) has expired and suspend them. */
+export async function subscriptionGracePeriodSweep(client = db) {
+    try {
+        const pastDueWorkspaces = await client.orm.public.Workspace
+            .where({ subscriptionStatus: "past_due", status: "active" })
+            .all();
+        const now = Date.now();
+        const sevenDaysMs = 7 * 24 * 60 * 60_000;
+        for (const w of pastDueWorkspaces) {
+            if (w.currentPeriodEnd && now - new Date(w.currentPeriodEnd).getTime() > sevenDaysMs) {
+                await client.orm.public.Workspace.where({ id: w.id }).update({
+                    status: "suspended",
+                    suspendedReason: "Subscription payment failed (grace period expired)",
+                });
+                console.warn(`[billing] Suspended workspace ${w.id} due to expired grace period`);
+            }
+        }
+    } catch (err) {
+        console.error("[billing] subscriptionGracePeriodSweep error:", err.message);
+    }
+}
+
+let started = false;
+export function startWorkers() {
+    if (started) return;
+    started = true;
+    every(15_000, () => pollDueEvents(), "event poll")();
+    every(60_000, () => heartbeat(), "job heartbeat");
+    every(60_000, () => resumeJobs(), "job resume")();
+    every(30_000, () => pollDueDeliveries(), "webhook poll");
+    every(10 * 60_000, rollupSweep, "rollup sweep")();
+    every(60 * 60_000, adSpendSweep, "ad spend sweep");
+    every(60 * 60_000, recoverEmptyFxRates, "FX empty-table recovery")();
+    every(60 * 60_000, fxRateSweep, "FX rate sync")();
+    every(6 * 60 * 60_000, subscriptionGracePeriodSweep, "subscription grace sweep");
+    every(24 * 60 * 60_000, async () => {
+        await applyRetention();
+        await purgeFinishedJobs(14);
+    }, "retention");
+    console.log("[worker] background workers started");
+}
+
+export async function stopWorkers() {
+    for (const t of timers) clearInterval(t);
+    timers.length = 0;
+    started = false;
+    await drainJobs();
+}
