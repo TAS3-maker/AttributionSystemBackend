@@ -46,6 +46,7 @@ const allowedOrigins = [
     "https://asftas.vercel.app",
     "http://localhost:5173",
     "http://localhost:5174",
+    "https://attributionsystemfrontend.netlify.app/landing",
     ...(ENV.NODE_ENV === "production" ? [] : ["http://localhost:3000", "http://localhost:5173", "http://localhost:5175"]),
 ];
 
