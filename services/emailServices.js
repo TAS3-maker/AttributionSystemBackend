@@ -10,7 +10,7 @@ function getTransporter() {
 
   if (!transporter) {
     transporter = nodemailer.createTransport({
-      service: "gmail",
+      service: "hostinger",
       auth: {
         user: ENV.SMTP_USER,
         pass: ENV.SMTP_PASS,
