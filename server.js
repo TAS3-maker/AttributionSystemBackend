@@ -33,6 +33,10 @@ app.use(express.json({
         req.rawBody = buffer.toString("utf8");
     },
 }));
+
+app.get('/', (req, res) => {
+    res.status(200).json({ status: "healthy", message: "Attribution Platform API"});
+})
 app.use(cookieParser());
 
 const allowedOrigins = [
